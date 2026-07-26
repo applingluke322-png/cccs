@@ -24,9 +24,42 @@ async function initDb() {
       created_at TIMESTAMP DEFAULT NOW()
     )
   `);
-  console.log("Accounts table ready.");
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bans (
+      id SERIAL PRIMARY KEY,
+      kind TEXT NOT NULL,          -- 'device' or 'account'
+      value TEXT NOT NULL,
+      reason TEXT DEFAULT '',
+      created_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(kind, value)
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS feedback (
+      id SERIAL PRIMARY KEY,
+      message TEXT NOT NULL,
+      username TEXT DEFAULT '',
+      device TEXT DEFAULT '',
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  console.log("Accounts + bans + feedback tables ready.");
 }
 initDb().catch((e) => console.error("DB init error:", e.message));
+
+const ADMIN_SECRET = process.env.ADMIN_SECRET || "change-me-please";
+
+async function isBanned(deviceId, username){
+  if(!pool) return null;
+  try{
+    const vals=[]; const parts=[];
+    if(deviceId){ parts.push("(kind='device' AND value=$"+(vals.length+1)+")"); vals.push(String(deviceId)); }
+    if(username){ parts.push("(kind='account' AND value=$"+(vals.length+1)+")"); vals.push(String(username).toLowerCase()); }
+    if(!parts.length) return null;
+    const r=await pool.query("SELECT kind, reason FROM bans WHERE "+parts.join(" OR ")+" LIMIT 1", vals);
+    return r.rowCount>0 ? r.rows[0] : null;
+  }catch(e){ return null; }
+}
 
 function newToken() { return crypto.randomBytes(24).toString("hex"); }
 
@@ -176,6 +209,132 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // ---- ADMIN BAN ENDPOINTS (protected by ADMIN_SECRET) ----
+  if (req.method === "POST" && (req.url === "/admin/ban" || req.url === "/admin/unban" || req.url === "/admin/bans")) {
+    (async () => {
+      if (!pool) return sendJson(res, 500, { error: "DB not set up." });
+      try {
+        const b = await readBody(req);
+        if (String(b.secret||"") !== ADMIN_SECRET) return sendJson(res, 403, { error: "Wrong admin password." });
+
+        if (req.url === "/admin/bans") {
+          const r = await pool.query("SELECT kind, value, reason, created_at FROM bans ORDER BY created_at DESC LIMIT 200");
+          return sendJson(res, 200, { ok: true, bans: r.rows });
+        }
+        const kind = (b.kind === "account") ? "account" : "device";
+        let value = String(b.value||"").trim();
+        if (kind === "account") value = value.toLowerCase();
+        if (!value) return sendJson(res, 400, { error: "Nothing to " + (req.url==='/admin/ban'?'ban':'unban') + "." });
+
+        if (req.url === "/admin/ban") {
+          await pool.query(
+            "INSERT INTO bans (kind, value, reason) VALUES ($1,$2,$3) ON CONFLICT (kind, value) DO UPDATE SET reason=$3",
+            [kind, value, String(b.reason||"")]
+          );
+          // kick any currently-connected matching players
+          for (const [pid, p] of players) {
+            if ((kind==='device' && p.deviceId===value) || (kind==='account' && (p.username||'').toLowerCase()===value)) {
+              try { send(p.ws, { type: "banned", reason: b.reason || "You have been banned." }); p.ws.close(); } catch(e){}
+            }
+          }
+          return sendJson(res, 200, { ok: true, banned: { kind, value } });
+        } else {
+          await pool.query("DELETE FROM bans WHERE kind=$1 AND value=$2", [kind, value]);
+          return sendJson(res, 200, { ok: true, unbanned: { kind, value } });
+        }
+      } catch (e) { return sendJson(res, 500, { error: "Server error: " + e.message }); }
+    })();
+    return;
+  }
+
+  // ---- FEEDBACK: players submit (no login needed) ----
+  if (req.method === "POST" && req.url === "/feedback") {
+    (async () => {
+      if (!pool) return sendJson(res, 500, { error: "Not set up." });
+      try {
+        const b = await readBody(req);
+        const message = String(b.message || "").trim().slice(0, 1000);
+        if (message.length < 2) return sendJson(res, 400, { error: "Message too short." });
+        const username = String(b.username || "").slice(0, 40);
+        const device = String(b.device || "").slice(0, 80);
+        await pool.query("INSERT INTO feedback (message, username, device) VALUES ($1,$2,$3)", [message, username, device]);
+        return sendJson(res, 200, { ok: true });
+      } catch (e) { return sendJson(res, 500, { error: "Server error: " + e.message }); }
+    })();
+    return;
+  }
+
+  // ---- ADMIN: view / clear feedback (protected) ----
+  if (req.method === "POST" && (req.url === "/admin/feedback" || req.url === "/admin/feedback-clear")) {
+    (async () => {
+      if (!pool) return sendJson(res, 500, { error: "DB not set up." });
+      try {
+        const b = await readBody(req);
+        if (String(b.secret || "") !== ADMIN_SECRET) return sendJson(res, 403, { error: "Wrong admin password." });
+        if (req.url === "/admin/feedback-clear") {
+          await pool.query("DELETE FROM feedback");
+          return sendJson(res, 200, { ok: true, cleared: true });
+        }
+        const r = await pool.query("SELECT message, username, device, created_at FROM feedback ORDER BY created_at DESC LIMIT 200");
+        return sendJson(res, 200, { ok: true, feedback: r.rows });
+      } catch (e) { return sendJson(res, 500, { error: "Server error: " + e.message }); }
+    })();
+    return;
+  }
+
+  // ---- ADMIN: list who's currently online (to spot spammers/guests) ----
+  if (req.method === "POST" && req.url === "/admin/online") {
+    (async () => {
+      try {
+        const b = await readBody(req);
+        if (String(b.secret || "") !== ADMIN_SECRET) return sendJson(res, 403, { error: "Wrong admin password." });
+        const list = [];
+        for (const [pid, p] of players) {
+          list.push({
+            name: (p.state && p.state.name) || "guest",
+            device: p.deviceId || "",
+            account: p.username || "",
+            muted: (p.mutedUntil && Date.now() < p.mutedUntil) || false
+          });
+        }
+        return sendJson(res, 200, { ok: true, count: list.length, players: list });
+      } catch (e) { return sendJson(res, 500, { error: "Server error: " + e.message }); }
+    })();
+    return;
+  }
+
+  // ---- LEADERBOARD (public - top players by money & level) ----
+  if (req.method === "GET" && req.url.startsWith("/leaderboard")) {
+    (async () => {
+      if (!pool) return sendJson(res, 500, { error: "Not set up." });
+      try {
+        // pull money & level out of the saved JSON data for each account
+        const r = await pool.query(`
+          SELECT username,
+                 COALESCE((data->>'money')::bigint, 0)  AS money,
+                 COALESCE((data->>'level')::int, 1)      AS level
+          FROM accounts
+          WHERE data IS NOT NULL
+          ORDER BY money DESC
+          LIMIT 20
+        `);
+        const byMoney = r.rows.map(x => ({ username: x.username, money: Number(x.money), level: x.level }));
+        const r2 = await pool.query(`
+          SELECT username,
+                 COALESCE((data->>'level')::int, 1)      AS level,
+                 COALESCE((data->>'money')::bigint, 0)   AS money
+          FROM accounts
+          WHERE data IS NOT NULL
+          ORDER BY level DESC, money DESC
+          LIMIT 20
+        `);
+        const byLevel = r2.rows.map(x => ({ username: x.username, level: x.level, money: Number(x.money) }));
+        return sendJson(res, 200, { ok: true, byMoney, byLevel });
+      } catch (e) { return sendJson(res, 500, { error: "Server error: " + e.message }); }
+    })();
+    return;
+  }
+
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("Chaos City multiplayer server is running.\n");
 });
@@ -201,10 +360,30 @@ function broadcast(obj, exceptId) {
   }
 }
 
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, req) => {
   const id = nextId++;
+
+  // parse device id + username from the connection URL for ban enforcement
+  let deviceId = "", username = "";
+  try {
+    const u = new URL(req.url, "http://x");
+    deviceId = u.searchParams.get("d") || "";
+    username = (u.searchParams.get("u") || "").toLowerCase();
+  } catch (e) {}
+
+  // check bans, then allow or reject
+  (async () => {
+    const ban = await isBanned(deviceId, username);
+    if (ban) {
+      try { send(ws, { type: "banned", reason: ban.reason || "You have been banned from Chaos Cidy." }); ws.close(); } catch(e){}
+      return;
+    }
+    admitPlayer();
+  })();
+
+  function admitPlayer(){
   players.set(id, {
-    ws,
+    ws, deviceId, username,
     state: { id, name: "player" + id, x: 0, z: 0, a: 0, inCar: false, mode: "" }
   });
 
@@ -245,8 +424,45 @@ wss.on("connection", (ws) => {
       broadcast({ type: "state", player: p.state }, id);
     } else if (data.type === "chat") {
       const p = players.get(id);
-      const text = ("" + (data.text || "")).slice(0, 120);
-      if (text) broadcast({ type: "chat", id, name: p.state.name, text }, -1);
+      if (!p) return;
+
+      // ---- ANTI-SPAM PROTECTION ----
+      const now = Date.now();
+      p.chatHist = p.chatHist || [];
+      p.mutedUntil = p.mutedUntil || 0;
+
+      // if currently muted for spamming, silently drop
+      if (now < p.mutedUntil) return;
+
+      // 1) cooldown: min 800ms between messages
+      if (p.lastChat && now - p.lastChat < 800) {
+        p.spamStrikes = (p.spamStrikes || 0) + 1;
+        if (p.spamStrikes >= 4) { p.mutedUntil = now + 15000; try{ p.ws.send(JSON.stringify({type:"chat",id:-1,name:"SYSTEM",text:"You're muted 15s for spamming. Slow down!"})); }catch(e){} }
+        return;
+      }
+
+      // 2) rate cap: max 5 messages per 10 seconds
+      p.chatHist = p.chatHist.filter(t => now - t < 10000);
+      if (p.chatHist.length >= 5) {
+        p.mutedUntil = now + 15000;
+        try{ p.ws.send(JSON.stringify({type:"chat",id:-1,name:"SYSTEM",text:"Too many messages — muted 15s."})); }catch(e){}
+        return;
+      }
+
+      let text = ("" + (data.text || "")).slice(0, 120).trim();
+      if (!text) return;
+
+      // 3) block exact repeats (copy-paste spam)
+      if (p.lastText && text.toLowerCase() === p.lastText.toLowerCase()) {
+        p.repeatCount = (p.repeatCount || 0) + 1;
+        if (p.repeatCount >= 2) { p.mutedUntil = now + 10000; return; }
+      } else { p.repeatCount = 0; }
+
+      // 4) squash walls of the same character (aaaaaa, !!!!!!)
+      text = text.replace(/(.)\1{9,}/g, "$1$1$1");
+
+      p.lastChat = now; p.lastText = text; p.chatHist.push(now); p.spamStrikes = 0;
+      broadcast({ type: "chat", id, name: p.state.name, text }, -1);
     }
   });
 
@@ -257,6 +473,7 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("error", () => {});
+  } // end admitPlayer
 });
 
 server.listen(PORT, () => {
