@@ -311,8 +311,8 @@ const server = http.createServer((req, res) => {
         // pull money & level out of the saved JSON data for each account
         const r = await pool.query(`
           SELECT username,
-                 COALESCE((data->>'money')::bigint, 0)  AS money,
-                 COALESCE((data->>'level')::int, 1)      AS level
+                 COALESCE(NULLIF(regexp_replace(data->>'money', '[^0-9]', '', 'g'), '')::numeric, 0) AS money,
+                 COALESCE((data->>'level')::int, 1) AS level
           FROM accounts
           WHERE data IS NOT NULL
           ORDER BY money DESC
@@ -321,8 +321,8 @@ const server = http.createServer((req, res) => {
         const byMoney = r.rows.map(x => ({ username: x.username, money: Number(x.money), level: x.level }));
         const r2 = await pool.query(`
           SELECT username,
-                 COALESCE((data->>'level')::int, 1)      AS level,
-                 COALESCE((data->>'money')::bigint, 0)   AS money
+                 COALESCE((data->>'level')::int, 1) AS level,
+                 COALESCE(NULLIF(regexp_replace(data->>'money', '[^0-9]', '', 'g'), '')::numeric, 0) AS money
           FROM accounts
           WHERE data IS NOT NULL
           ORDER BY level DESC, money DESC
